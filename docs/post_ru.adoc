@@ -1,0 +1,281 @@
+= Тестирование сервисов на Spring с Testcontainers
+
+Нередко даже для тестирования небольших проектов требуется наличие определённой инфраструктуры: баз данных, брокеров очередей сообщений, кеш-серверов и т.д. Можно использовать какие-то встраиваемые решения, но не факт, что они на 100% соответствуют требованиям проекта. Так, например, популярная встраиваемая СУБД H2 не имеет полной поддержки всех типов PostgreSQL. Можно развёртывать для тестирования всю необходимую инфраструктуру, но это несёт дополнительные затраты, в том числе и на сопровождение. Кроме того разработчикам, возможно, придётся разворачивать тестовую инфраструктуру локально на своих ПК, что тоже не всегда удобно.
+
+Но все эти проблемы были действительно актуальны до повсеместного внедрения инструментов контейнеризации, в частности Docker. С появлением Docker появилась возможность разворачивать компоненты тестового окружения в контейнерах и отказаться от встраиваемых решений. До появления фреймворка Testcontainers приходилось пользоваться различными плагинами, либо самостоятельно писать скрипты для запуска контейнеров перед тестами. Testcontainers позволяет управлять жизненным циклом контейнеров прямо из тестов.
+
+В этой статье я рассмотрю применение Testcontainers при тестировании исходного кода, взаимодействующего с СУБД PostgreSQL с помощью Spring Framework JDBC.
+
+== Зависимости проекта
+Для проекта потребуются следующие зависимости:
+
+*  `org.springframework.boot:spring-boot-starter-web` -- для демонстрационного REST-сервиса
+*  `org.springframework.boot:spring-boot-starter-jdbc` -- для использования API Spring JDBC
+*  `org.postgresql:postgresql` -- драйвер PostgreSQL
+*  `org.testcontainers:junit-jupiter` -- для поддержки JUnit 5
+*  `org.testcontainers:postgresql` -- для API Testcontainers, специфичных для PostgreSQL
+*  `org.springframework.boot:spring-boot-starter-test` -- для тестирования
+
+В рамках данной статьи я буду демонстрировать использование Testcontainers совместно с JUnit 4 и JUnit 5, но в реальных условиях, вы, скорее всего, будете использовать какой-то один фрейморк, поэтому помните об исключении лишних зависимостей из проекта. И обратите внимание на то, что Spring Boot, начиная с версий `2.2.x` использует в качестве основного тестового фреймворка JUnit 5, в то время как Testcontainers в качестве основного продолжает использовать JUnit 4.
+
+== Тестируемые классы
+В моём тестовом сервисе есть класс-репозиторий:
+
+.SpringJdbcFrameworkRepository.java
+[source,java]
+----
+package name.alexkosarev.tutorial.repository;
+
+import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
+import name.alexkosarev.tutorial.Framework;
+import org.springframework.jdbc.core.JdbcOperations;
+import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.simple.SimpleJdbcInsertOperations;
+
+import java.util.List;
+import java.util.Map;
+
+@RequiredArgsConstructor
+public final class SpringJdbcFrameworkRepository implements FrameworkRepository {
+
+    @NonNull
+    private final SimpleJdbcInsertOperations insertOperations;
+
+    @NonNull
+    private final JdbcOperations jdbcOperations;
+
+    @NonNull
+    private final RowMapper<Framework>  frameworkRowMapper;
+
+    @Override
+    public List<Framework> findAllFrameworks() {
+        return this.jdbcOperations.query("select * from test.framework", this.frameworkRowMapper);
+    }
+
+    @Override
+    public int persistFramework(@NonNull Framework framework) {
+        return this.insertOperations.executeAndReturnKey(Map.of(
+                "name", framework.getName(),
+                "language", framework.getLanguage(),
+                "link", framework.getLink()
+        )).intValue();
+    }
+}
+----
+
+Кроме него есть ещё пара классов `FrameworkRowMapper` и `FrameworkSimpleJdbcInsert`, которые используются для преобразования `ResultSet` в `Framework` и вставки новых записей в таблицу соответственно, а так же простой REST-сервис `FrameworkRestController`.
+
+В тестовых ресурсах есть sql-файл со схемой БД и тестовыми данными:
+
+.db.sql
+[source,sql]
+----
+create schema test;
+
+create table test.framework
+(
+    id       serial primary key,
+    name     varchar(255) not null unique,
+    language varchar(255),
+    link     varchar(255)
+);
+
+insert into test.framework (name, language, link)
+values ('Spring Framework', 'Java', 'https://spring.io'),
+       ('Vue.js', 'JavaScript', 'https://vuejs.org'),
+       ('Laravel', 'PHP', 'https://laravel.com');
+
+----
+
+== Использование Testcontainers
+Для тестирования `SpringJdbcFrameworkRepository` требуется запустить контейнер с PostgreSQL и создать объект типа `javax.sql.DataSource`, предоставляющий подключение к тестовой базе данных.
+
+Для этого я создам объект класса `PostgreSQLContainer`, а полученные от него `jdbcUrl`, `username` и `password` буду использовать для создания `HikariDataSource`.
+
+При помощи аргументов конструкторов контейнеров можно указать образ и версию, которую вы хотите использовать для тестов. Это полезно, когда стандартная для Testcontainers версия образа не соответствует требуемой (например, мой проект использует PostgreSQL 11, тогда как Testcontainers по умолчанию предоставляет версию 9.6.12), либо требуется какой-то модифицированный образ.
+
+Кроме этого все типы контейнеров позволяют указывать дополнительные параметры, как специфичные, так и общие, например при помощи метода `withInitScript` можно указать путь к sql-файлу, который будет выполнен после запуска `JdbcContainer`, а при помощи метода `withExposedPorts` можно задать список портов, которые контейнер должен опубликовать.
+
+=== JUnit 5
+В JUnit 5 фреймворк Testcontainers использует механизм расширений. Если класс отмечен аннотацией `@Testcontainers`, то Testcontainers найдёт все члены тестового класса, отмеченные аннотацией `@Container` и автоматически запустит соответствующие контейнеры.
+
+Если свойство, отмеченное аннотацией `@Container` имеет модификатор `static`, то контейнер будет использоваться для всех тестов, в противном случае контейнер будет запускаться для каждого теста индивидуально.
+
+Пример тестов:
+
+.JUnit5SpringJdbcFrameworkRepositoryTest.java
+[source,java]
+----
+package name.alexkosarev.tutorial.repository;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import name.alexkosarev.tutorial.Framework;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+@Testcontainers
+class JUnit5SpringJdbcFrameworkRepositoryTest {
+
+    @Container
+    private final PostgreSQLContainer<?> POSTGRESQL_CONTAINER =
+            new PostgreSQLContainer<>("postgres:11")// Создать контейнер из образа postgres:11
+                    .withInitScript("db.sql");// Выполнить db.sql после запуска
+
+    private SpringJdbcFrameworkRepository repository;
+
+    @BeforeEach
+    void setUp() {
+        var hikariConfig = new HikariConfig();
+        hikariConfig.setJdbcUrl(POSTGRESQL_CONTAINER.getJdbcUrl());// Получить реальный jdbcUrl
+        hikariConfig.setUsername(POSTGRESQL_CONTAINER.getUsername());// Получить username
+        hikariConfig.setPassword(POSTGRESQL_CONTAINER.getPassword());// Получить password
+        var dataSource = new HikariDataSource(hikariConfig);
+        repository = new SpringJdbcFrameworkRepository(new FrameworkSimpleJdbcInsert(dataSource),
+                new JdbcTemplate(dataSource), FrameworkRowMapper.getInstance());
+    }
+
+    @Test
+    void findAllFrameworks_ReturnsFrameworksList() {
+        // when
+        var frameworks = repository.findAllFrameworks();
+
+        // then
+        assertNotNull(frameworks);
+        assertEquals(3, frameworks.size());
+        assertEquals(new Framework(1, "Spring Framework", "Java", "https://spring.io"),
+                frameworks.get(0));
+    }
+
+    @Test
+    void persistFramework_ReturnsGeneratedId( ){
+        // given
+        var framework = new Framework("Testcontainers Java", "Java", "https://www.testcontainers.org/");
+
+        // when
+        var newId = repository.persistFramework(framework);
+
+        // then
+        assertEquals(4, newId);
+    }
+}
+----
+
+В моём случае перед выполнением каждого теста будет подниматься контейнер из образа `postgres:11` и выполняться sql-файл `db.sql` для заполнения БД тестовыми данными.
+
+=== JUnit 4
+В JUnit 4 Testcontainers использует механизм правил. Для этого каждый контейнер должен быть отмечен аннотацией `@Rule` и иметь модификатор доступа `public`.
+
+.JUnit4SpringJdbcFrameworkRepositoryTest.java
+[source,java]
+----
+package name.alexkosarev.tutorial.repository;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import name.alexkosarev.tutorial.Framework;
+import org.junit.*;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.testcontainers.containers.PostgreSQLContainer;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
+public class JUnit4SpringJdbcFrameworkRepositoryTest {
+
+    @Rule
+    public final PostgreSQLContainer<?> POSTGRESQL_CONTAINER =
+            new PostgreSQLContainer<>("postgres:11")
+                    .withInitScript("db.sql");
+
+    private SpringJdbcFrameworkRepository repository;
+
+    @Before
+    public void setUp() {
+        var hikariConfig = new HikariConfig();
+        hikariConfig.setJdbcUrl(POSTGRESQL_CONTAINER.getJdbcUrl());
+        hikariConfig.setUsername(POSTGRESQL_CONTAINER.getUsername());
+        hikariConfig.setPassword(POSTGRESQL_CONTAINER.getPassword());
+        var dataSource = new HikariDataSource(hikariConfig);
+        repository = new SpringJdbcFrameworkRepository(new FrameworkSimpleJdbcInsert(dataSource),
+                new JdbcTemplate(dataSource), FrameworkRowMapper.getInstance());
+    }
+
+    @Test
+    public void findAllFrameworks_ReturnsFrameworksList() {
+        // when
+        var frameworks = repository.findAllFrameworks();
+
+        // then
+        assertNotNull(frameworks);
+        assertEquals(3, frameworks.size());
+        assertEquals(new Framework(1, "Spring Framework", "Java", "https://spring.io"),
+                frameworks.get(0));
+    }
+
+    @Test
+    public void persistFramework_ReturnsGeneratedId( ){
+        // given
+        var framework = new Framework("Testcontainers Java", "Java", "https://www.testcontainers.org/");
+
+        // when
+        var newId = repository.persistFramework(framework);
+
+        // then
+        assertEquals(4, newId);
+    }
+}
+----
+
+В остальном отличия только в использовании API JUnit 4, вместо JUnit 5.
+
+=== Интеграционные тесты со Spring Boot
+В случае с интеграционными тестами в контексте приложения достаточно зарегистрировать компонент типа `javax.sql.DataSource`, который будет использоваться вместо автоматически конфигурируемого.
+
+.TestConfig.java
+[source,java]
+----
+package name.alexkosarev.tutorial.config;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.testcontainers.containers.JdbcDatabaseContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
+
+import javax.sql.DataSource;
+
+@TestConfiguration
+public class TestConfig {
+
+    // запуск и остановка контейнера по lifecycle-событиями компонента (1)
+    @Bean(initMethod = "start", destroyMethod = "stop")
+    public JdbcDatabaseContainer<?> jdbcDatabaseContainer() {
+        return new PostgreSQLContainer<>("postgres:11")
+                .withInitScript("db.sql")
+                .waitingFor(Wait.forListeningPort());// ожидание доступности порта (2)
+    }
+
+    @Bean
+    public DataSource dataSource(JdbcDatabaseContainer<?> jdbcDatabaseContainer) {
+        var hikariConfig = new HikariConfig();
+        hikariConfig.setJdbcUrl(jdbcDatabaseContainer.getJdbcUrl());
+        hikariConfig.setUsername(jdbcDatabaseContainer.getUsername());
+        hikariConfig.setPassword(jdbcDatabaseContainer.getPassword());
+
+        return new HikariDataSource(hikariConfig);
+    }
+}
+----
+
+Я зарегистрировал сам контейнер в контексте приложения в виде отдельного компонента, чтобы иметь возможность автоматически запускать и останавливать его в зависимости от lifecycle-событий приложения. Так же я добавил ожидание доступности порта, по которому будет производиться подключение к PostgreSQL, чтобы тесты начинали выполняться только после того, как сервер PostgreSQL будет готов.
